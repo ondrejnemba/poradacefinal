@@ -437,6 +437,18 @@ function mkOrder(n) {
   return { id: uid(), customer: "", expL: "", type: "PP/PP", width: 75, qty: 0, status: "draft", machine: "BDM_MRAMOR", deadline: "", notes: "", novinka: true, stitek: false, vpPolep: false, etiketa: false, etiketaHang: false, seq: n, lock: false, ps: "", seqAP1: n, lockAP1: false, psAP1: "", seqCEN: n, lockCEN: false, psCEN: "", seqHANG: n, lockHANG: false, psHANG: "", actualQty: 0, actStartBDM: '', actStartAP1: '', actStartCEN: '', actStartHANG: '', actEndBDM: '', actEndAP1: '', actEndCEN: '', actEndHANG: '' };
 }
 
+/* ═══ ROLE RESOLVER ═══ */
+async function resolveRole(userId, email) {
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from("user_roles").select("role, label").eq("user_id", userId).single();
+      if (data && !error) return { role: data.role, label: data.label || email.split("@")[0] };
+      console.warn("user_roles:", error?.message || "no row for", email);
+    } catch (e) { console.warn("user_roles error:", e.message); }
+  }
+  return { role: "viewer", label: email.split("@")[0] };
+}
+
 /* ═══ LOGIN — Supabase Auth ═══ */
 function Login({ onLogin }) {
   const [email, setEmail] = useState(""); const [pass, setPass] = useState(""); const [err, setErr] = useState(""); const [loading, setLoading] = useState(false);
@@ -447,12 +459,7 @@ function Login({ onLogin }) {
       try {
         const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
         if (error) throw error;
-        let role = "viewer", label = email.split("@")[0];
-        try {
-          const { data: rd, error: re } = await supabase.from("user_roles").select("role, label").eq("user_id", data.user.id).single();
-          if (rd && !re) { role = rd.role; label = rd.label || label; }
-          else console.warn("Role fetch:", re?.message || "no data → viewer");
-        } catch (rx) { console.warn("Role fetch error:", rx.message, "→ viewer"); }
+        const { role, label } = await resolveRole(data.user.id, email);
         onLogin({ id: data.user.id, email, role, label });
       } catch (e) { setErr(e.message); }
     } else {
@@ -477,12 +484,9 @@ export default function App() {
   const [loggedIn, setLoggedIn] = useState(null); const [checking, setChecking] = useState(true);
   useEffect(() => { if (!supabase) { setChecking(false); return; } (async () => {
     const { data: { session } } = await supabase.auth.getSession();
-    if (session?.user) { let role="viewer",label=session.user.email.split("@")[0];
-        try {
-          const{data:rd,error:re}=await supabase.from("user_roles").select("role,label").eq("user_id",session.user.id).single();
-          if(rd&&!re){role=rd.role;label=rd.label||label;}
-          else console.warn("Session role:",re?.message||"no data → viewer");
-        } catch(rx){console.warn("Session role error:",rx.message,"→ viewer");} setLoggedIn({id:session.user.id,email:session.user.email,role,label}); }
+    if (session?.user) {
+        const { role, label } = await resolveRole(session.user.id, session.user.email);
+        setLoggedIn({id:session.user.id,email:session.user.email,role,label}); }
     setChecking(false); })(); }, []);
   if (checking) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:T.tm}}>Ověřuji session...</div>;
   if (!loggedIn) return <Login onLogin={setLoggedIn}/>;
