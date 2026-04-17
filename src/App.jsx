@@ -447,8 +447,12 @@ function Login({ onLogin }) {
       try {
         const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
         if (error) throw error;
-        let role = "planner", label = email.split("@")[0];
-        try { const { data: rd } = await supabase.from("user_roles").select("role, label").eq("user_id", data.user.id).single(); if (rd) { role=rd.role; label=rd.label||label; } } catch {}
+        let role = "viewer", label = email.split("@")[0];
+        try {
+          const { data: rd, error: re } = await supabase.from("user_roles").select("role, label").eq("user_id", data.user.id).single();
+          if (rd && !re) { role = rd.role; label = rd.label || label; }
+          else console.warn("Role fetch:", re?.message || "no data → viewer");
+        } catch (rx) { console.warn("Role fetch error:", rx.message, "→ viewer"); }
         onLogin({ id: data.user.id, email, role, label });
       } catch (e) { setErr(e.message); }
     } else {
@@ -473,7 +477,12 @@ export default function App() {
   const [loggedIn, setLoggedIn] = useState(null); const [checking, setChecking] = useState(true);
   useEffect(() => { if (!supabase) { setChecking(false); return; } (async () => {
     const { data: { session } } = await supabase.auth.getSession();
-    if (session?.user) { let role="planner",label=session.user.email.split("@")[0]; try { const{data:rd}=await supabase.from("user_roles").select("role,label").eq("user_id",session.user.id).single(); if(rd){role=rd.role;label=rd.label||label;} } catch{} setLoggedIn({id:session.user.id,email:session.user.email,role,label}); }
+    if (session?.user) { let role="viewer",label=session.user.email.split("@")[0];
+        try {
+          const{data:rd,error:re}=await supabase.from("user_roles").select("role,label").eq("user_id",session.user.id).single();
+          if(rd&&!re){role=rd.role;label=rd.label||label;}
+          else console.warn("Session role:",re?.message||"no data → viewer");
+        } catch(rx){console.warn("Session role error:",rx.message,"→ viewer");} setLoggedIn({id:session.user.id,email:session.user.email,role,label}); }
     setChecking(false); })(); }, []);
   if (checking) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:T.tm}}>Ověřuji session...</div>;
   if (!loggedIn) return <Login onLogin={setLoggedIn}/>;
@@ -831,17 +840,17 @@ function OrdRow({ o, sel, dragging, onSel, upd, packed, onDragStart, selected, o
   const bd = dragging ? "#f59e0b" : selected ? "#6366f1" : sel ? T.ac : complete ? "#d1d5db" : isNovinka ? "#fb923c" : late ? "#fecaca" : T.bd;
 
   return (
-    <div onClick={(e) => { if ((e.shiftKey || e.ctrlKey || e.metaKey) && onShiftSel) onShiftSel(e); else onSel(); }}
+    <div onClick={(e) => { if (!ro && (e.shiftKey || e.ctrlKey || e.metaKey) && onShiftSel) onShiftSel(e); else onSel(); }}
       style={{ padding: "0", borderRadius: 6, marginBottom: 2, background: bg, border: `1px solid ${bd}`, opacity: complete ? 0.45 : 1, cursor: "pointer", display: "flex" }}>
       {/* Drag handle + lock (always visible for planned orders) */}
       {onLockToggle ? (
         <div style={{ display: "flex", flexDirection: "column", width: 14, flexShrink: 0, borderRadius: "6px 0 0 6px", overflow: "hidden" }}>
-          <div onPointerDown={e => { if (!o.lock && onDragStart) { e.stopPropagation(); onDragStart(e); } }}
-            style={{ flex: 1, cursor: o.lock ? "not-allowed" : "grab", background: o.lock ? "#fecaca" : sel ? "#93c5fd" : "#e5e7eb",
+          <div onPointerDown={e => { if (!ro && !o.lock && onDragStart) { e.stopPropagation(); onDragStart(e); } }}
+            style={{ flex: 1, cursor: (ro || o.lock) ? "not-allowed" : "grab", background: o.lock ? "#fecaca" : sel ? "#93c5fd" : "#e5e7eb",
               display: "flex", alignItems: "center", justifyContent: "center", touchAction: "none", opacity: o.lock ? 0.5 : 1 }}>
             <span style={{ fontSize: 10, color: "#9ca3af", lineHeight: 1 }}>⠿</span>
           </div>
-          <div onClick={e => { e.stopPropagation(); onLockToggle(o.id); }}
+          <div onClick={e => { e.stopPropagation(); if(!ro) onLockToggle(o.id); }}
             title={o.lock?"Odemknout":"Zamknout (zamkne i předchozí zakázky v BDM pořadí)"}
             style={{ height: 14, cursor: "pointer", background: o.lock ? "#dc2626" : "#f3f4f6", color: o.lock ? "#fff" : "#9ca3af",
               display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9 }}>
@@ -1311,7 +1320,7 @@ function Gantt({ orders, setOrders, packed, dts, setDts, settings, selId, setSel
               <div onPointerDown={e => handleDrag(e,p.order,m)} onClick={() => setSelId(p.order.id===selId?null:p.order.id)}
                 style={{ position: "absolute", top: y1, left: 52+mi*colW+3, width: colW-6, height: Math.max(h,18),
                   background: p.actEnd?"#16a34a"+"cc":p.wip?"#f59e0b"+"dd":isDraft?MACHINES[m].color+"30":MACHINES[m].color+"dd", borderRadius: 3,
-                  cursor: p.order[{AP1:"lockAP1",CENTRA:"lockCEN",HANG:"lockHANG"}[m]||"lock"]?"not-allowed":"grab", zIndex: 5,
+                  cursor: ro?"default":p.order[{AP1:"lockAP1",CENTRA:"lockCEN",HANG:"lockHANG"}[m]||"lock"]?"not-allowed":"grab", zIndex: 5,
                   border: isSel?`2px solid ${T.tx}`:p.order.lock?`2px solid #dc2626`:`1px solid ${MACHINES[m].color}`,
                   display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", overflow: "hidden", padding: "1px 3px",
                   boxShadow: isSel?"0 0 0 2px #fff":"0 1px 2px rgba(0,0,0,.12)",
