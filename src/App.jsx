@@ -1591,30 +1591,49 @@ function Gantt({ orders, setOrders, packed, dts, setDts, settings, selId, setSel
 
   const handleDrag = (e, order, machine) => {
     if (ro) return;
-    // Respect lock
     const lockK = {AP1:"lockAP1",CENTRA:"lockCEN",HANG:"lockHANG"}[machine]||"lock";
     if (order[lockK]) return;
     e.preventDefault();
     const seqK = {AP1:"seqAP1",CENTRA:"seqCEN",HANG:"seqHANG"}[machine]||"seq";
-    dragRef.current = { orderId: order.id, machine, startY: e.clientY, seqK, lockK };
+    // Determine downstream seqKeys (machines AFTER this one in flow)
+    const flow = ["seq","seqAP1","seqCEN","seqHANG"];
+    const flowLocks = ["lock","lockAP1","lockCEN","lockHANG"];
+    const myFlowIdx = flow.indexOf(seqK);
+    const downstreamKeys = flow.slice(myFlowIdx + 1);
+    const downstreamLocks = flowLocks.slice(myFlowIdx + 1);
+
+    dragRef.current = { orderId: order.id, machine, startY: e.clientY, seqK, lockK, downstreamKeys, downstreamLocks };
     const onMove = ev => { if (!dragRef.current) return; const dy = ev.clientY - dragRef.current.startY, delta = Math.round(dy/30);
-      if (delta !== 0) { setOrders(prev => { const next = prev.map(o=>({...o})), sk = dragRef.current.seqK, lk = dragRef.current.lockK;
+      if (delta !== 0) { setOrders(prev => { const next = prev.map(o=>({...o}));
+        const sk = dragRef.current.seqK, lk = dragRef.current.lockK;
         const mO = next.filter(o => { if (MACHINES[machine].phase===1) return o.machine===machine && !o.novinka; if (machine==="CENTRA") return needsCentra(o) && !o.novinka; return !isComplete(o) && !o.novinka; }).sort((a,b) => pf(a[sk])-pf(b[sk]));
         const idx = mO.findIndex(o => o.id===dragRef.current.orderId); if (idx<0) return prev;
         const ni = clamp(idx+delta,0,mO.length-1); if (ni===idx) return prev;
-        // Check target position isn't between locked blocks that would be violated
-        const target = mO[ni];
-        if (target && target[lk]) return prev; // can't swap with locked
+        // Can't swap with locked block on this machine
+        if (mO[ni] && mO[ni][lk]) return prev;
+        // Upstream constraint check: can't move earlier if upstream hasn't produced material yet
+        if (ni < idx) {
+          const getUpstreamEnd = (ord) => {
+            if (machine === "AP1") return (packed[ord.machine||"BDM_MRAMOR"]||[]).find(p=>p.order.id===ord.id)?.end;
+            if (machine === "CENTRA") return (packed.AP1||[]).find(p=>p.order.id===ord.id)?.end;
+            if (machine === "HANG") {
+              const ce = needsCentra(ord) ? (packed.CENTRA||[]).find(p=>p.order.id===ord.id)?.end : null;
+              return ce || (packed.AP1||[]).find(p=>p.order.id===ord.id)?.end;
+            }
+            return null; // BDM has no upstream
+          };
+          const myUpEnd = getUpstreamEnd(order);
+          const targetUpEnd = getUpstreamEnd(mO[ni]);
+          if (myUpEnd && targetUpEnd && myUpEnd > targetUpEnd) return prev;
+        }
         const [moved] = mO.splice(idx,1); mO.splice(ni,0,moved);
-        // Update this machine's sequence for moved + FOLLOWING orders only (not previous)
-        const movedIdx = mO.findIndex(o => o.id === dragRef.current.orderId);
-        const startFrom = Math.min(idx, ni, movedIdx);
+        // Update ONLY this machine's sequence (not upstream!)
+        mO.forEach((o,i) => { if (!o[lk]) o[sk] = i; });
+        // Propagate to DOWNSTREAM sequences only (unlocked)
+        const dsk = dragRef.current.downstreamKeys, dlk = dragRef.current.downstreamLocks;
         mO.forEach((o,i) => {
-          if (i >= startFrom && !o[lk]) o[sk] = i;
-          // Propagate to downstream sequences ONLY for moved order and orders after it
-          if (i >= startFrom) {
-            if (!o.lock) o.seq = i;
-            o.seqAP1 = i; o.seqCEN = i; o.seqHANG = i;
+          for (let d = 0; d < dsk.length; d++) {
+            if (!o[dlk[d]]) o[dsk[d]] = i;
           }
         });
         dragRef.current.startY = ev.clientY; return next; }); } };
@@ -1669,19 +1688,28 @@ function Gantt({ orders, setOrders, packed, dts, setDts, settings, selId, setSel
             const y1 = tY(p.start)+hdrH, h = Math.max(tY(p.end)-tY(p.start),4);
             const isDraft = STATUSES[p.order.status]?.draft, isSel = p.order.id===selId;
             const flags = [p.order.stitek&&"Š",p.order.vpPolep&&"VP",p.order.etiketa&&"E",p.order.etiketaHang&&"EH"].filter(Boolean);
+            const mlk = {AP1:"lockAP1",CENTRA:"lockCEN",HANG:"lockHANG"}[m]||"lock";
+            const isLk = !!p.order[mlk];
             return (<div key={`${m}_${pi}`}>
               {p.coStart&&p.coMin>0 && <div style={{ position: "absolute", top: tY(p.coStart)+hdrH, left: 52+mi*colW+3, width: colW-6, height: Math.max((p.coMin/60)*zoom,2), background: "#fbbf2444", border: "1px solid #fbbf2466", borderRadius: 2, zIndex: 3 }}/>}
               <div onPointerDown={e => handleDrag(e,p.order,m)} onClick={() => setSelId(p.order.id===selId?null:p.order.id)}
                 style={{ position: "absolute", top: y1, left: 52+mi*colW+3, width: colW-6, height: Math.max(h,18),
                   background: p.actEnd?"#16a34a"+"cc":p.wip?"#f59e0b"+"dd":isDraft?MACHINES[m].color+"30":MACHINES[m].color+"dd", borderRadius: 3,
-                  cursor: p.order[{AP1:"lockAP1",CENTRA:"lockCEN",HANG:"lockHANG"}[m]||"lock"]?"not-allowed":"grab", zIndex: 5,
-                  border: isSel?`2px solid ${T.tx}`:p.order.lock?`2px solid #dc2626`:`1px solid ${MACHINES[m].color}`,
+                  cursor: ro?"default":isLk?"not-allowed":"grab", zIndex: 5,
+                  border: isSel?`2px solid ${T.tx}`:isLk?`2px solid #dc2626`:`1px solid ${MACHINES[m].color}`,
                   display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", overflow: "hidden", padding: "1px 3px",
                   boxShadow: isSel?"0 0 0 2px #fff":"0 1px 2px rgba(0,0,0,.12)",
                     ...(p.actEnd ? {borderBottom: "3px solid #16a34a"} : {}) }}>
-                <span style={{ fontSize: 9, fontWeight: 600, color: isDraft?MACHINES[m].color:"#fff", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%" }}>{p.order.lock?"🔒 ":""}{p.order.customer||p.order.type} {p.order.width}</span>
+                <span style={{ fontSize: 9, fontWeight: 600, color: isDraft?MACHINES[m].color:"#fff", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%" }}>{isLk?"🔒 ":""}{p.order.customer||p.order.type} {p.order.width}</span>
                 {flags.length>0&&h>24 && <span style={{ fontSize: 7, color: isDraft?MACHINES[m].color:"#ffffffbb", marginTop: 1 }}>{flags.join(" ")}</span>}
               </div>
+              {!ro && h >= 14 && <div onClick={e => { e.stopPropagation(); upd(p.order.id, {[mlk]: !isLk}); }}
+                title={isLk?`Odemknout ${MACHINES[m].label}`:`Zamknout na ${MACHINES[m].label}`}
+                style={{ position: "absolute", top: y1+1, left: 52+mi*colW+colW-14, width: 12, height: 12, borderRadius: 2,
+                  background: isLk?"#dc2626":"rgba(255,255,255,0.3)", cursor: "pointer", zIndex: 8,
+                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: 7, color: isLk?"#fff":"#fff8" }}>
+                {isLk?"🔒":"🔓"}
+              </div>}
               {p.order.deadline&&m==="HANG"&&(()=>{ const dl=pd(p.order.deadline); if(!dl) return null; const target=addD(dl,-1); const lbl=p.order.customer||`#${p.order.id.slice(0,4)}`; return <>
                 <div style={{ position: "absolute", top: tY(target)+hdrH-1, left: 52+mi*colW, width: colW, height: 2, background: "repeating-linear-gradient(90deg,#f59e0b 0,#f59e0b 4px,transparent 4px,transparent 8px)", zIndex: 6, pointerEvents: "none" }} title={`Cíl (den před termínem): ${lbl}`}/>
                 <div style={{ position: "absolute", top: tY(dl)+hdrH-1, left: 52+mi*colW, width: colW, height: 2, background: "#dc2626", zIndex: 6, pointerEvents: "none" }} title={`Termín: ${lbl} — ${czD(p.order.deadline)}`}/>
