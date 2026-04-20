@@ -202,7 +202,24 @@ function packAll(orders, manualDts, settings) {
     if (c) preH[o.id] = c;
   }
   const pHA = packCol("HANG", a1o.filter(o => preH[o.id]), allDts, settings, preH);
-  return { BDM_MRAMOR: pBM||[], BDM_PP: pBP||[], AP1: pA1||[], CENTRA: pCE||[], HANG: pHA||[], _dts: allDts };
+
+  // ── WIP COMPUTATION ──
+  // WIP = pieces finished on BDM but not yet finished on HANG (in pipeline)
+  const WIP_LIMIT = 80000;
+  const wipEvents = [];
+  for (const p of [...pBM, ...pBP]) wipEvents.push({ time: p.end, qty: pf(p.order.qty), type: 1 }); // BDM done → enters buffer
+  for (const p of pHA) wipEvents.push({ time: p.start, qty: pf(p.order.qty), type: -1 }); // HANG start → leaves buffer (onto machine → dispatch)
+  wipEvents.sort((a,b) => a.time - b.time);
+  let wipCur = 0, wipMax = 0, wipTimeline = [], wipOverflowDate = null;
+  for (const e of wipEvents) {
+    wipCur += e.qty * e.type;
+    wipMax = Math.max(wipMax, wipCur);
+    wipTimeline.push({ time: e.time, wip: wipCur });
+    if (wipCur > WIP_LIMIT && !wipOverflowDate) wipOverflowDate = e.time;
+  }
+  const wipData = { timeline: wipTimeline, max: wipMax, limit: WIP_LIMIT, overflow: wipMax > WIP_LIMIT, overflowDate: wipOverflowDate, current: wipCur };
+
+  return { BDM_MRAMOR: pBM||[], BDM_PP: pBP||[], AP1: pA1||[], CENTRA: pCE||[], HANG: pHA||[], _dts: allDts, _wip: wipData };
 }
 
 /* ═══ OPTIMIZER ═══ */
@@ -437,62 +454,177 @@ function mkOrder(n) {
   return { id: uid(), customer: "", expL: "", type: "PP/PP", width: 75, qty: 0, status: "draft", machine: "BDM_MRAMOR", deadline: "", notes: "", novinka: true, stitek: false, vpPolep: false, etiketa: false, etiketaHang: false, seq: n, lock: false, ps: "", seqAP1: n, lockAP1: false, psAP1: "", seqCEN: n, lockCEN: false, psCEN: "", seqHANG: n, lockHANG: false, psHANG: "", actualQty: 0, actStartBDM: '', actStartAP1: '', actStartCEN: '', actStartHANG: '', actEndBDM: '', actEndAP1: '', actEndCEN: '', actEndHANG: '' };
 }
 
-/* ═══ ROLE RESOLVER ═══ */
-async function resolveRole(userId, email) {
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.from("user_roles").select("role, label").eq("user_id", userId).single();
-      if (data && !error) return { role: data.role, label: data.label || email.split("@")[0] };
-      console.warn("user_roles:", error?.message || "no row for", email);
-    } catch (e) { console.warn("user_roles error:", e.message); }
+/* ═══ SHIFT ANALYSIS — post-optimization ═══ */
+function analyzeShifts(orders, manualDts, settings, packed) {
+  const dayNames = ["Ne","Po","Út","St","Čt","Pá","So"];
+  const dayCost = (dow) => dow >= 1 && dow <= 5 ? 0 : dow === 6 ? 1 : 2;
+  const active = orders.filter(o => !isComplete(o) && !o.novinka);
+  const increases = [], decreases = [];
+  let savedH = 0, addedH = 0;
+
+  // ── 1. FIND LATE ORDERS → suggest targeted increases ──
+  const lateOrders = [];
+  for (const o of active) {
+    if (!o.deadline) continue;
+    const he = (packed.HANG||[]).find(p => p.order.id === o.id);
+    if (he) {
+      const dl = pd(o.deadline), target = addD(dl, -1);
+      if (he.end > target) lateOrders.push({ order: o, hangEnd: he.end, deadline: dl, deficit: (he.end - target) / 36e5 });
+    }
   }
-  return { role: "viewer", label: email.split("@")[0] };
+  if (lateOrders.length > 0) {
+    // Per-machine deficit from late orders
+    const deficits = {};
+    for (const lo of lateOrders) {
+      for (const m of MK) {
+        const mp = (packed[m]||[]).find(p => p.order.id === lo.order.id);
+        if (mp && lo.deficit > 0) deficits[m] = Math.max(deficits[m]||0, lo.deficit);
+      }
+    }
+    for (const [m, deficit] of Object.entries(deficits)) {
+      if (deficit <= 0) continue;
+      const dlDate = new Date(Math.max(...lateOrders.map(lo => lo.deadline.getTime())));
+      const candidates = [];
+      for (let d = new Date(dlDate); d >= new Date(); d = addD(d, -1)) {
+        const curH = getShiftH(m, d, settings);
+        const gain = 24 - curH;
+        if (gain > 0) candidates.push({ date: new Date(d), dow: d.getDay(), currentH: curH, gainH: gain,
+          dbd: Math.round((dlDate - d) / 864e5), label: dayNames[d.getDay()] + " " + czD(d) });
+      }
+      candidates.sort((a,b) => a.dbd - b.dbd || dayCost(a.dow) - dayCost(b.dow));
+      let rem = deficit; const picked = [];
+      for (const c of candidates) {
+        if (rem <= 0) break;
+        const add = Math.min(Math.ceil(rem), c.gainH);
+        picked.push({ ...c, newH: c.currentH + add });
+        addedH += add; rem -= add;
+      }
+      if (picked.length > 0) increases.push({ machine: m, label: MACHINES[m].label, deficit: Math.ceil(deficit), days: picked.slice(0, 6),
+        reason: lateOrders.filter(lo => (packed[m]||[]).find(p => p.order.id === lo.order.id)).map(lo => lo.order.customer).join(", ") });
+    }
+  }
+
+  // ── 2. FIND UNDERUTILIZED DAYS → suggest reductions ──
+  for (const m of MK) {
+    const blocks = packed[m] || [];
+    if (blocks.length === 0) continue;
+    const lastEnd = blocks.reduce((max, p) => p.end > max ? p.end : max, new Date(0));
+    const horizon = addD(new Date(), 60);
+    const reductions = [];
+
+    for (let d = new Date(); d <= horizon; d = addD(d, 1)) {
+      const curH = getShiftH(m, d, settings);
+      if (curH <= 0) continue;
+      const dayStart = new Date(d); dayStart.setHours(getShiftStart(m, settings), 0, 0, 0);
+      const dayEnd = addH(dayStart, curH);
+
+      // Count production hours on this day
+      let prodH = 0;
+      for (const b of blocks) {
+        const bs = b.start > dayStart ? b.start : dayStart;
+        const be = b.end < dayEnd ? b.end : dayEnd;
+        if (be > bs) prodH += (be - bs) / 36e5;
+      }
+
+      const utilization = prodH / curH;
+
+      // Day after all production ends → full reduction
+      if (d > lastEnd && d > new Date()) {
+        reductions.push({ date: new Date(d), dow: d.getDay(), currentH: curH, newH: 0, savedH: curH,
+          label: dayNames[d.getDay()] + " " + czD(d), reason: "po skončení výroby" });
+        savedH += curH; continue;
+      }
+
+      // Weekend with < 25% utilization → suggest removal
+      if ((d.getDay() === 0 || d.getDay() === 6) && utilization < 0.25 && curH > 0) {
+        const newH = 0;
+        reductions.push({ date: new Date(d), dow: d.getDay(), currentH: curH, newH, savedH: curH,
+          label: dayNames[d.getDay()] + " " + czD(d), reason: `${fmt(utilization*100,0)}% využití` });
+        savedH += curH; continue;
+      }
+
+      // Weekday with < 30% utilization → suggest reducing to actual + buffer
+      if (utilization < 0.3 && curH > 8 && d.getDay() >= 1 && d.getDay() <= 5) {
+        const newH = Math.max(8, Math.ceil(prodH * 1.3)); // actual + 30% buffer, min 8h
+        if (newH < curH) {
+          reductions.push({ date: new Date(d), dow: d.getDay(), currentH: curH, newH, savedH: curH - newH,
+            label: dayNames[d.getDay()] + " " + czD(d), reason: `${fmt(utilization*100,0)}% využití` });
+          savedH += (curH - newH);
+        }
+      }
+    }
+    if (reductions.length > 0) decreases.push({ machine: m, label: MACHINES[m].label, days: reductions.slice(0, 8) });
+  }
+
+  // ── 3. WIP BUFFER ANALYSIS ──
+  const WIP_LIMIT = 80000;
+  const wip = packed._wip;
+  let wipSuggestion = null;
+  if (wip && wip.max > WIP_LIMIT * 0.7) {
+    // Calculate sustainable BDM rate
+    // BDM throughput = average norm * BDM hours/day
+    // HANG throughput = hang norm * HANG hours/day (bottleneck)
+    const hangNorm = getNorm("HANG", settings, "MRAMOR"); // ~350
+    const bdmNormAvg = (getNorm("BDM_MRAMOR", settings, "MRAMOR") + getNorm("BDM_MRAMOR", settings, "PP/PAP")) / 2;
+    const hangShift = (settings?.shifts?.HANG?.weekday) || 16;
+    const hangDaily = hangNorm * hangShift; // ks/day HANG can consume
+
+    // How many hours BDM should run to match HANG throughput
+    const sustainableBdmH = Math.ceil(hangDaily / bdmNormAvg);
+
+    // Current BDM hours
+    const bdmShift = (settings?.shifts?.BDM_MRAMOR?.weekday) || 24;
+
+    // Days until overflow (if BDM outproduces)
+    const bdmDaily = bdmNormAvg * bdmShift;
+    const dailyDelta = bdmDaily - hangDaily;
+    const daysToOverflow = dailyDelta > 0 ? Math.floor(WIP_LIMIT / dailyDelta) : Infinity;
+
+    wipSuggestion = {
+      wipMax: wip.max,
+      wipLimit: WIP_LIMIT,
+      wipPct: Math.round(wip.max / WIP_LIMIT * 100),
+      overflow: wip.overflow,
+      overflowDate: wip.overflowDate,
+      bdmCurrent: bdmShift,
+      bdmSustainable: Math.min(sustainableBdmH, 24),
+      hangThroughput: hangDaily,
+      bdmThroughput: bdmDaily,
+      dailyDelta: Math.round(dailyDelta),
+      daysToOverflow: daysToOverflow === Infinity ? null : daysToOverflow,
+    };
+
+    // If BDM is overproducing, add to decreases
+    if (bdmShift > sustainableBdmH && dailyDelta > 0) {
+      const bdmReduction = bdmShift - Math.min(sustainableBdmH + 2, bdmShift); // +2h buffer for flexibility
+      if (bdmReduction > 0) {
+        savedH += bdmReduction * 5; // ~5 weekdays saved per week
+        // Don't add duplicate if already suggested
+        const existing = decreases.find(d => d.machine === "BDM_MRAMOR" && d.wipRelated);
+        if (!existing) {
+          decreases.push({
+            machine: "BDM_MRAMOR", label: MACHINES.BDM_MRAMOR.label, wipRelated: true,
+            days: [{ label: "Všední dny", currentH: bdmShift, newH: Math.min(sustainableBdmH + 2, 24),
+              savedH: bdmReduction, reason: `WIP: BDM vyrábí ${Math.round(dailyDelta)} ks/den víc než HANG stíhá` }]
+          });
+        }
+      }
+    }
+  }
+
+  return { increases, decreases, savedH: Math.round(savedH), addedH: Math.round(addedH), netH: Math.round(savedH - addedH),
+    lateCount: lateOrders.length, wipSuggestion };
 }
 
-/* ═══ LOGIN — Supabase Auth ═══ */
-function Login({ onLogin }) {
-  const [email, setEmail] = useState(""); const [pass, setPass] = useState(""); const [err, setErr] = useState(""); const [loading, setLoading] = useState(false);
-  const tryLogin = async () => {
-    if (!email || !pass) { setErr("Vyplňte email a heslo"); return; }
-    setLoading(true); setErr("");
-    if (supabase) {
-      try {
-        const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
-        if (error) throw error;
-        const { role, label } = await resolveRole(data.user.id, email);
-        onLogin({ id: data.user.id, email, role, label });
-      } catch (e) { setErr(e.message); }
-    } else {
-      const offlineUsers = {"admin@emba.cz":"admin","plan@emba.cz":"planner","view@emba.cz":"viewer"};
-      const r = offlineUsers[email]; if (r && pass.length >= 1) onLogin({ id: email, email, role: r, label: email.split("@")[0] }); else setErr("Offline — admin@emba.cz / plan@emba.cz / view@emba.cz");
-    }
-    setLoading(false);
-  };
-  return (<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:T.bg,fontFamily:"'Inter',system-ui,sans-serif"}}>
-    <div style={{...cSt,width:340,padding:32,boxShadow:"0 8px 30px rgba(0,0,0,.08)"}}>
-      <div style={{fontSize:20,fontWeight:700,color:"#c2410c",marginBottom:4}}>EMBA Pořadače</div>
-      <div style={{fontSize:12,color:T.tm,marginBottom:20}}>APS Plánovač výroby</div>
-      <input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} style={{...iSt,marginBottom:8}} onKeyDown={e=>e.key==="Enter"&&tryLogin()} autoFocus/>
-      <input placeholder="Heslo" type="password" value={pass} onChange={e=>setPass(e.target.value)} style={{...iSt,marginBottom:8}} onKeyDown={e=>e.key==="Enter"&&tryLogin()}/>
-      {err&&<div style={{fontSize:12,color:"#dc2626",marginBottom:8}}>{err}</div>}
-      <button onClick={tryLogin} disabled={loading} style={{...bPr,width:"100%",opacity:loading?0.6:1}}>{loading?"Přihlašuji...":"Přihlásit"}</button>
-      {!hasSupabase && <div style={{fontSize:10,color:T.tf,textAlign:"center",marginTop:12}}>Offline režim (localStorage)</div>}
-    </div></div>);
-}
-/* ═══ APP ═══ */
-export default function App() {
-  const [loggedIn, setLoggedIn] = useState(null); const [checking, setChecking] = useState(true);
-  useEffect(() => { if (!supabase) { setChecking(false); return; } (async () => {
-    const { data: { session } } = await supabase.auth.getSession();
-    if (session?.user) {
-        const { role, label } = await resolveRole(session.user.id, session.user.email);
-        setLoggedIn({id:session.user.id,email:session.user.email,role,label}); }
-    setChecking(false); })(); }, []);
-  if (checking) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:T.tm}}>Ověřuji session...</div>;
-  if (!loggedIn) return <Login onLogin={setLoggedIn}/>;
-  const handleLogout = async () => { if (supabase) await supabase.auth.signOut(); setLoggedIn(null); };
-  return <AppInner user={loggedIn} onLogout={handleLogout}/>;
-}
+/* ═══ ROLE ═══ */
+async function resolveRole(u,e){if(supabase){try{const{data:d,error:r}=await supabase.from("user_roles").select("role,label").eq("user_id",u).single();if(d&&!r)return{role:d.role,label:d.label||e.split("@")[0]};}catch{}}return{role:"viewer",label:e.split("@")[0]};}
+function Login({onLogin}){const[email,setEmail]=useState("");const[pass,setPass]=useState("");const[err,setErr]=useState("");const[loading,setLoading]=useState(false);
+const tryLogin=async()=>{if(!email||!pass){setErr("Vyplňte");return;}setLoading(true);setErr("");if(supabase){try{const{data,error}=await supabase.auth.signInWithPassword({email,password:pass});if(error)throw error;const{role,label}=await resolveRole(data.user.id,email);onLogin({id:data.user.id,email,role,label});}catch(e){setErr(e.message);}}else{const ou={"admin@emba.cz":"admin","plan@emba.cz":"planner","view@emba.cz":"viewer"};const r=ou[email];if(r&&pass.length>=1)onLogin({id:email,email,role:r,label:email.split("@")[0]});else setErr("Offline");}setLoading(false);};
+return(<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:T.bg,fontFamily:"'Inter',system-ui,sans-serif"}}><div style={{...cSt,width:340,padding:32,boxShadow:"0 8px 30px rgba(0,0,0,.08)"}}><div style={{fontSize:20,fontWeight:700,color:"#c2410c",marginBottom:4}}>EMBA Pořadače</div><div style={{fontSize:12,color:T.tm,marginBottom:20}}>APS Plánovač výroby</div><input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} style={{...iSt,marginBottom:8}} onKeyDown={e=>e.key==="Enter"&&tryLogin()} autoFocus/><input placeholder="Heslo" type="password" value={pass} onChange={e=>setPass(e.target.value)} style={{...iSt,marginBottom:8}} onKeyDown={e=>e.key==="Enter"&&tryLogin()}/>{err&&<div style={{fontSize:12,color:"#dc2626",marginBottom:8}}>{err}</div>}<button onClick={tryLogin} disabled={loading} style={{...bPr,width:"100%",opacity:loading?0.6:1}}>{loading?"Přihlašuji...":"Přihlásit"}</button>{!hasSupabase&&<div style={{fontSize:10,color:T.tf,textAlign:"center",marginTop:12}}>Offline</div>}</div></div>);}
+export default function App(){const[loggedIn,setLoggedIn]=useState(null);const[checking,setChecking]=useState(true);
+useEffect(()=>{if(!supabase){setChecking(false);return;}(async()=>{const{data:{session}}=await supabase.auth.getSession();if(session?.user){const{role,label}=await resolveRole(session.user.id,session.user.email);setLoggedIn({id:session.user.id,email:session.user.email,role,label});}setChecking(false);})();},[]);
+if(checking)return<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:T.tm}}>Ověřuji...</div>;if(!loggedIn)return<Login onLogin={setLoggedIn}/>;
+const handleLogout=async()=>{if(supabase)await supabase.auth.signOut();setLoggedIn(null);};return<AppInner user={loggedIn} onLogout={handleLogout}/>;}
 function AppInner({ user, onLogout }) {
   const [orders, setOrders] = useState(SAMPLE.map(o=>({...o})));
   const [dts, setDts] = useState([]);
@@ -508,18 +640,30 @@ function AppInner({ user, onLogout }) {
     try {
       const d = await dbLoad(DATA_KEY);
       if (d?.orders?.length) { setOrders(d.orders); if (d.dts) setDts(d.dts); if (d.settings) setSettings({...DEF,...d.settings}); } else { setNeedsOpt(true); }
-    } catch {}
-    setDbOk(getDbStatus());
+      setDbOk(true);
+    } catch { setDbOk(false); }
     setLoaded(true);
   })(); }, []);
   useEffect(() => { if (needsOpt && loaded && orders.length > 0) { handleOpt(); setNeedsOpt(false); } }, [needsOpt, loaded]);
-  useEffect(() => { if (loaded) { dbSave(DATA_KEY, { orders, dts, settings }); setTimeout(() => setDbOk(getDbStatus()), 600); } }, [orders, dts, settings, loaded]);
+  useEffect(() => { if (loaded) { try { dbSave(DATA_KEY, { orders, dts, settings }); } catch { setDbOk(false); } } }, [orders, dts, settings, loaded]);
 
   const packed = useMemo(() => packAll(orders, dts, settings), [orders, dts, settings]);
+  useEffect(() => { window.__embaSetSettings = setSettings; return () => { delete window.__embaSetSettings; }; }, [setSettings]);
+  const [optResult, setOptResult] = useState(null);
   const ro = user.role === "viewer";
   const upd = (id, patch) => setOrders(p => p.map(o => o.id === id ? {...o,...patch} : o));
   const del = (id) => { setOrders(p => p.filter(o => o.id !== id)); if (editId === id) setEditId(null); if (selId === id) setSelId(null); };
-  const handleOpt = () => { const n = orders.map(o=>({...o})); optFull(n, settings); setOrders(n); };
+
+  const handleOpt = () => {
+    const n = orders.map(o=>({...o})); optFull(n, settings); setOrders(n);
+    // Post-optimization shift analysis
+    setTimeout(() => {
+      const p = packAll(n, dts, settings);
+      const analysis = analyzeShifts(n, dts, settings, p);
+      if (analysis.increases.length > 0 || analysis.decreases.length > 0) setOptResult(analysis);
+      else setOptResult(null);
+    }, 50);
+  };
   const newOrder = () => { const o = mkOrder(orders.length); setOrders(p => [...p, o]); setEditId(o.id); setView("form"); };
 
   if (!loaded) return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: T.tm, fontFamily: "system-ui" }}>Načítám…</div>;
@@ -540,6 +684,70 @@ function AppInner({ user, onLogout }) {
         <button onClick={onLogout} style={{...bSe,padding:"3px 8px",fontSize:10}}>Odhlásit</button>
         {user.role!=="viewer"&&<button onClick={newOrder} style={{...bPr, padding: "5px 12px", fontSize: 12}}>+ Zakázka</button>}
       </div>
+      {/* Optimization result panel */}
+      {optResult && <div style={{padding:"8px 16px",background:"#eff6ff",borderBottom:`1px solid #bfdbfe`,fontSize:11,flexShrink:0,maxHeight:200,overflowY:"auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+          <b style={{fontSize:12}}>⚡ Výsledek optimalizace</b>
+          <button onClick={()=>setOptResult(null)} style={{background:"none",border:"none",cursor:"pointer",fontSize:14,color:T.tm}}>✕</button>
+        </div>
+        <div style={{display:"flex",gap:16,marginBottom:6,flexWrap:"wrap"}}>
+          {optResult.lateCount > 0 && <span style={{color:"#dc2626"}}>⚠ Nestíhá: <b>{optResult.lateCount}</b> zakázek</span>}
+          {optResult.savedH > 0 && <span style={{color:"#16a34a"}}>▼ Úspora: <b>{optResult.savedH}h</b> směn</span>}
+          {optResult.addedH > 0 && <span style={{color:"#d97706"}}>▲ Navýšení: <b>{optResult.addedH}h</b></span>}
+          <span style={{fontWeight:700,color:optResult.netH>0?"#16a34a":"#d97706"}}>Čistý efekt: {optResult.netH>0?"+":"" }{optResult.netH}h {optResult.netH>0?"úspora":"navýšení"}</span>
+        </div>
+        {optResult.increases.length > 0 && <div style={{marginBottom:4}}>
+          <b style={{color:"#d97706"}}>▲ Doporučené navýšení (blízko termínů):</b>
+          {optResult.increases.map((sg,i) => <div key={i} style={{marginLeft:8,marginTop:2}}>
+            <b>{sg.label}</b> ({sg.reason}):
+            {sg.days.map((d,j) => <span key={j} style={{marginLeft:4}}>{d.label} {d.currentH}→<b>{d.newH}h</b></span>)}
+          </div>)}
+        </div>}
+        {optResult.decreases.length > 0 && <div style={{marginBottom:4}}>
+          <b style={{color:"#16a34a"}}>▼ Doporučené snížení (nízké využití):</b>
+          {optResult.decreases.map((sg,i) => <div key={i} style={{marginLeft:8,marginTop:2}}>
+            <b>{sg.label}</b>{sg.wipRelated?" 📦":""}:
+            {sg.days.slice(0,4).map((d,j) => <span key={j} style={{marginLeft:4}}>{d.label} {d.currentH}→<b>{d.newH}h</b> <span style={{color:T.tf}}>({d.reason})</span></span>)}
+            {sg.days.length > 4 && <span style={{color:T.tf}}> +{sg.days.length-4} dalších</span>}
+          </div>)}
+        </div>}
+        {optResult.wipSuggestion && <div style={{marginBottom:4,padding:"6px 8px",background:optResult.wipSuggestion.overflow?"#fef2f2":"#fffbeb",borderRadius:4,border:`1px solid ${optResult.wipSuggestion.overflow?"#fecaca":"#fde68a"}`}}>
+          <b>📦 Mezioperační sklad (WIP)</b>
+          <div style={{display:"flex",gap:12,marginTop:3,flexWrap:"wrap"}}>
+            <span>Max: <b style={{color:optResult.wipSuggestion.wipPct>90?"#dc2626":optResult.wipSuggestion.wipPct>70?"#d97706":"#16a34a"}}>{optResult.wipSuggestion.wipMax.toLocaleString("cs")} ks</b> / {optResult.wipSuggestion.wipLimit.toLocaleString("cs")} ({optResult.wipSuggestion.wipPct}%)</span>
+            {optResult.wipSuggestion.dailyDelta > 0 && <span>BDM přebytek: <b style={{color:"#d97706"}}>{optResult.wipSuggestion.dailyDelta.toLocaleString("cs")} ks/den</b></span>}
+            {optResult.wipSuggestion.daysToOverflow && <span style={{color:"#dc2626"}}>Přetečení za <b>{optResult.wipSuggestion.daysToOverflow} dní</b></span>}
+          </div>
+          {optResult.wipSuggestion.bdmCurrent > optResult.wipSuggestion.bdmSustainable && <div style={{marginTop:3,color:"#1e40af"}}>
+            💡 Optimální BDM směna: <b>{optResult.wipSuggestion.bdmSustainable}h/den</b> (teď {optResult.wipSuggestion.bdmCurrent}h) — srovná BDM s kapacitou HANG ({optResult.wipSuggestion.hangThroughput.toLocaleString("cs")} ks/den)
+          </div>}
+          <div style={{marginTop:3,height:8,background:"#e5e7eb",borderRadius:4,overflow:"hidden"}}>
+            <div style={{height:"100%",width:Math.min(optResult.wipSuggestion.wipPct,100)+"%",background:optResult.wipSuggestion.wipPct>90?"#dc2626":optResult.wipSuggestion.wipPct>70?"#f59e0b":"#16a34a",borderRadius:4,transition:"width 0.3s"}}/>
+          </div>
+        </div>}
+        <button onClick={() => {
+          const ov = { ...(settings.shiftOverrides || {}) };
+          for (const sg of [...optResult.increases, ...optResult.decreases]) {
+            for (const d of sg.days) {
+              if (d.date) { ov[`${sg.machine}_${isoD(d.date)}`] = d.newH; }
+            }
+          }
+          // Apply global BDM shift reduction from WIP analysis
+          const wipSg = optResult.wipSuggestion;
+          let newSettings = {...settings, shiftOverrides: ov};
+          if (wipSg && wipSg.bdmCurrent > wipSg.bdmSustainable) {
+            const optH = Math.min(wipSg.bdmSustainable + 2, 24);
+            newSettings = {...newSettings, shifts: {...newSettings.shifts,
+              BDM_MRAMOR: {...newSettings.shifts.BDM_MRAMOR, weekday: optH},
+              BDM_PP: {...newSettings.shifts.BDM_PP, weekday: optH}
+            }};
+          }
+          setSettings(newSettings);
+          setOptResult(prev => ({...prev, applied: true}));
+        }} disabled={optResult.applied} style={{...bPr,padding:"4px 14px",fontSize:11,opacity:optResult.applied?0.5:1}}>
+          {optResult.applied ? "✓ Změny aplikovány" : "Aplikovat všechny změny směn"}
+        </button>
+      </div>}
       <div style={{ flex: 1, overflow: (view === "gantt" || view === "form") ? "hidden" : "auto", padding: (view === "gantt" || view === "form") ? 0 : 16 }}>
         {view === "dashboard" && <Dash orders={orders} packed={packed} settings={settings} ro={ro} onEdit={id => { setEditId(id); setView("form"); }} dts={dts} setSettings={ro?()=>{}:setSettings}/>}
         {view === "form" && <FormV orders={orders} editId={editId} setEditId={setEditId} upd={ro?()=>{}:upd} del={ro?()=>{}:del} ro={ro} settings={settings} dts={dts} packed={packed} onOpt={ro?()=>{}:handleOpt} setOrders={ro?()=>{}:setOrders}/>}
@@ -579,6 +787,21 @@ function Dash({ orders, packed, settings, ro, onEdit, dts, setSettings }) {
         {[["Aktivní", active.length, T.ac],["Potvrzené", confirmed.length, "#16a34a"],["Celkem ks", active.reduce((s,o)=>s+pf(o.qty),0).toLocaleString("cs"), "#c2410c"]].map(([l,v,c],i) => (
           <div key={i} style={{...cSt, borderLeft: `3px solid ${c}`, padding: "6px 12px", display: "flex", alignItems: "center", gap: 8, flex: "1 1 120px"}}><span style={{ fontSize: 11, color: T.tm }}>{l}</span><span style={{ fontSize: 18, fontWeight: 700 }}>{v}</span></div>
         ))}
+        {packed._wip && (() => {
+          const w = packed._wip, pct = Math.round(w.max / w.limit * 100);
+          const color = pct > 90 ? "#dc2626" : pct > 70 ? "#d97706" : "#16a34a";
+          return <div style={{...cSt, borderLeft: `3px solid ${color}`, padding: "6px 12px", flex: "1 1 180px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontSize:11,color:T.tm}}>📦 WIP</span>
+              <span style={{fontSize:18,fontWeight:700}}>{w.max.toLocaleString("cs")}</span>
+              <span style={{fontSize:10,color:T.tf}}>/ {w.limit.toLocaleString("cs")} ({pct}%)</span>
+            </div>
+            <div style={{height:5,background:"#e5e7eb",borderRadius:3,marginTop:4,overflow:"hidden"}}>
+              <div style={{height:"100%",width:Math.min(pct,100)+"%",background:color,borderRadius:3}}/>
+            </div>
+            {w.overflow && <div style={{fontSize:9,color:"#dc2626",marginTop:2,fontWeight:600}}>⚠ Přetečení skladu! {w.overflowDate ? czD(w.overflowDate) : ""}</div>}
+          </div>;
+        })()}
       </div>
       <div style={{...cSt, marginBottom: 16}}><div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Kapacita strojů</div>
         <div style={{ display: "flex", gap: 20, flexWrap: "wrap", justifyContent: "center" }}>{capData.map(c => <Donut key={c.m} value={c.h} max={c.maxH||1} color={c.color} label={c.label} unit="h" size={56}/>)}
@@ -1009,18 +1232,15 @@ function FormV({ orders, editId, setEditId, upd, del, settings, dts, packed, onO
       const target = next.find(o => o.id === orderId);
       if (!target) return prev;
       if (target.lock) {
-        // Unlock — just this one
+        // Unlock — just this one (BDM only)
         target.lock = false;
-        target.lockAP1 = false;
-        target.lockCEN = false;
-        target.lockHANG = false;
       } else {
-        // Lock — this one AND all preceding in BDM seq
+        // Lock BDM position — this one AND all preceding in BDM seq
+        // Does NOT lock AP1/CEN/HANG (downstream follows BDM order anyway)
         const sorted = next.filter(o => !isComplete(o) && !o.novinka).sort((a,b) => pf(a.seq) - pf(b.seq));
         const idx = sorted.findIndex(o => o.id === orderId);
         for (let i = 0; i <= idx; i++) {
-          const o = sorted[i];
-          o.lock = true; o.lockAP1 = true; o.lockCEN = true; o.lockHANG = true;
+          sorted[i].lock = true;
         }
       }
       return next;
@@ -1120,7 +1340,7 @@ function FormV({ orders, editId, setEditId, upd, del, settings, dts, packed, onO
                 <div style={{ fontSize: 14, fontWeight: 700 }}>{order.customer || `#${order.id.slice(0,4)}`}</div>
                 <button onClick={() => setEditId(null)} style={{ background: "none", border: "none", color: T.tm, cursor: "pointer", fontSize: 16 }}>✕</button>
               </div>
-              <OrdEd order={order} upd={ro?()=>{}:upd} del={ro?()=>{}:del} ro={ro} settings={settings} orders={orders} dts={dts} packed={packed}/>
+              <OrdEd order={order} upd={ro?()=>{}:upd} del={ro?()=>{}:del} ro={ro} settings={settings} orders={orders} dts={dts} packed={packed} setOrders={ro?()=>{}:setOrders}/>
             </div>
           : <div style={{ padding: 40, textAlign: "center", color: T.tf, fontSize: 12 }}>
               <div style={{ fontSize: 24, marginBottom: 8 }}>📋</div>
@@ -1140,11 +1360,82 @@ function SuggestBtn({ order, orders, dts, settings }) {
   if (!open) return <button onClick={() => setOpen(true)} style={{...bSe,padding:"4px 10px",fontSize:11}}>Navrhnout termín</button>;
   const run = () => {
     const s = suggestDL(order, orders, dts, settings);
-    // Filter by date range
+    const fromD = pd(from), toD = pd(to);
     if (s.deadline) {
-      const fromD = pd(from), toD = pd(to);
-      if (s.deadline < fromD) s.adjusted = "Nejdřívější možný termín je před vybraným rozmezím.";
-      if (s.deadline > toD) s.adjusted = "Termín by přesáhl vybrané rozmezí — doporučeno zvýšit kapacitu.";
+      // Strict range: clamp deadline to range
+      if (fromD && s.deadline < fromD) {
+        s.deadline = fromD;
+        s.adjusted = "Nejdřívější termín posunut na začátek rozmezí.";
+      }
+      if (toD && s.deadline > toD) {
+        s.deadline = toD;
+        s.adjusted = "Termín by přesáhl rozmezí — zkrácen na konec rozmezí.";
+      }
+      // Analyze conflicts: which orders would be affected
+      const tempOrders = [...orders.filter(o=>o.id!==order.id), {...order, deadline: s.deadline.toISOString().slice(0,10)}];
+      const tempPacked = packAll(tempOrders, dts, settings);
+      const conflicts = [];
+      for (const o of tempOrders) {
+        if (isComplete(o) || o.novinka || !o.deadline) continue;
+        const he = (tempPacked.HANG||[]).find(p=>p.order.id===o.id);
+        if (he) {
+          const dl = pd(o.deadline), target = addD(dl, -1);
+          if (he.end > target) conflicts.push({ order: o, hangEnd: he.end, deadline: dl });
+        }
+      }
+      s.conflicts = conflicts;
+      // Suggest shift extensions for bottleneck machines
+      if (conflicts.length > 0) {
+        // Calculate per-machine deficit: how many hours each machine needs
+        const deficits = {};
+        for (const c of conflicts) {
+          for (const m of MK) {
+            const mp = (tempPacked[m]||[]).find(p=>p.order.id===c.order.id);
+            if (mp && c.hangEnd > c.deadline) {
+              const gap = (c.hangEnd - c.deadline) / 36e5;
+              deficits[m] = Math.max(deficits[m]||0, gap);
+            }
+          }
+        }
+        // For each machine with deficit, find specific days to extend
+        const suggestions = [];
+        const dayCost = (dow) => dow >= 1 && dow <= 5 ? 0 : dow === 6 ? 1 : 2;
+        const dayNames = ["Ne","Po","Út","St","Čt","Pá","So"];
+        for (const [m, deficit] of Object.entries(deficits)) {
+          if (deficit <= 0) continue;
+          // Scan days BEFORE latest conflict deadline (backwards — closer to deadline = more impact)
+          const dlDate = new Date(Math.max(...conflicts.map(c=>c.deadline.getTime())));
+          const candidates = [];
+          for (let d = new Date(dlDate); d >= new Date(); d = addD(d, -1)) {
+            const curH = getShiftH(m, d, settings);
+            const dow = d.getDay();
+            const gain = 24 - curH;
+            if (gain > 0) {
+              const daysBeforeDL = Math.round((dlDate - d) / 864e5);
+              candidates.push({ date: new Date(d), dow, currentH: curH, gainH: gain, daysBeforeDL,
+                label: dayNames[dow] + " " + czD(d) });
+            }
+          }
+          // Sort: closest to deadline first, within same distance prefer cheaper days
+          candidates.sort((a,b) => a.daysBeforeDL - b.daysBeforeDL || dayCost(a.dow) - dayCost(b.dow));
+          // Greedily pick minimum days to cover deficit — extend each day only as much as needed
+          let remaining = deficit;
+          const picked = [];
+          for (const c of candidates) {
+            if (remaining <= 0) break;
+            // Take only what we need from this day, rounded up to whole hours
+            const needed = Math.ceil(remaining);
+            const addH = Math.min(needed, c.gainH);
+            const newH = c.currentH + addH;
+            picked.push({ ...c, newH });
+            remaining -= addH;
+          }
+          if (picked.length > 0) {
+            suggestions.push({ machine: m, machineLabel: MACHINES[m].label, deficit: Math.ceil(deficit), days: picked.slice(0, 6) });
+          }
+        }
+        s.shiftSuggestions = suggestions;
+      }
     }
     setResult(s);
   };
@@ -1159,10 +1450,42 @@ function SuggestBtn({ order, orders, dts, settings }) {
         <button onClick={run} style={{...bPr,padding:"3px 10px",fontSize:10}}>Spočítat</button>
         <button onClick={()=>{setOpen(false);setResult(null);}} style={{...bSe,padding:"3px 10px",fontSize:10}}>Zavřít</button>
       </div>
-      {result && <div style={{marginTop:6,padding:"4px 6px",background:T.sf,borderRadius:4,fontSize:11}}>
+      {result && <div style={{marginTop:6,padding:"6px 8px",background:T.sf,borderRadius:4,fontSize:11}}>
         {result.deadline
-          ? <><b>Nejdřívější:</b> {czDT(result.deadline)} (stroj {result.machine})
-              {result.adjusted && <div style={{color:"#d97706",fontSize:10,marginTop:2}}>⚠ {result.adjusted}</div>}</>
+          ? <><b>Termín:</b> {czDT(result.deadline)} (stroj {result.machine})
+              {result.adjusted && <div style={{color:"#d97706",fontSize:10,marginTop:2}}>⚠ {result.adjusted}</div>}
+              {result.conflicts?.length > 0 && <div style={{marginTop:4,color:"#dc2626",fontSize:10}}>
+                <b>Ohrožené zakázky ({result.conflicts.length}):</b>
+                {result.conflicts.slice(0,5).map((c,i) => <div key={i}>· {c.order.customer} ({czD(c.order.deadline)}) — HANG +{fmt((c.hangEnd-c.deadline)/36e5,1)}h</div>)}
+              </div>}
+              {result.shiftSuggestions?.length > 0 && <div style={{marginTop:4,color:"#1e40af",fontSize:10}}>
+                <b>Doporučené změny směn (minimum úprav):</b>
+                {result.shiftSuggestions.map((sg,i) => <div key={i} style={{marginTop:3,padding:"3px 6px",background:"#eff6ff",borderRadius:3,border:"1px solid #bfdbfe"}}>
+                  <b>{sg.machineLabel}</b> (deficit: {sg.deficit}h)
+                  {sg.days.map((d,j) => <div key={j} style={{marginLeft:8}}>▲ {d.label}: {d.currentH}h → <b>{d.newH}h</b> (+{d.newH-d.currentH}h)</div>)}
+                </div>)}
+                <button onClick={() => {
+                  // Apply all suggested overrides
+                  const ov = { ...(settings.shiftOverrides || {}) };
+                  for (const sg of result.shiftSuggestions) {
+                    for (const d of sg.days) {
+                      ov[`${sg.machine}_${isoD(d.date)}`] = d.newH;
+                    }
+                  }
+                  upd && upd(order.id, { deadline: result.deadline ? isoD(result.deadline) : order.deadline });
+                  // Update settings via parent (setSettings comes through)
+                  if (typeof setOrders === 'function') {
+                    // Trigger settings change through a custom event or direct call
+                  }
+                  // Apply overrides to settings
+                  const newSettings = { ...settings, shiftOverrides: ov };
+                  if (window.__embaSetSettings) window.__embaSetSettings(newSettings);
+                  setResult({...result, applied: true});
+                }} disabled={result.applied} style={{...bPr,padding:"3px 10px",fontSize:10,marginTop:4,opacity:result.applied?0.5:1}}>
+                  {result.applied ? "✓ Aplikováno" : "Aplikovat změny směn"}
+                </button>
+              </div>}
+          </>
           : <span style={{color:"#dc2626"}}>Nelze naplánovat</span>}
       </div>}
     </div>
@@ -1182,7 +1505,7 @@ function DeleteBtn({ onDelete }) {
 }
 
 /* ═══ ORDER EDITOR ═══ */
-function OrdEd({ order, upd, del, settings, orders, dts, packed, ro }) {
+function OrdEd({ order, upd, del, settings, orders, dts, packed, ro, setOrders }) {
   const [sug, setSug] = useState(null);
   const u = (f,v) => upd(order.id,{[f]:v});
   const handleType = t => upd(order.id,{type:t});
@@ -1202,7 +1525,32 @@ function OrdEd({ order, upd, del, settings, orders, dts, packed, ro }) {
 
       </div>
       <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginTop: 14, padding: "10px 12px", background: T.alt, borderRadius: 6, border: `1px solid ${T.bl}` }}>
-        <Check label="Novinka" checked={order.novinka} onChange={v => u("novinka",v)}/>
+        <Check label="Novinka" checked={order.novinka} onChange={v => {
+          if (!v && order.deadline) {
+            // Novinka → planned: insert at correct position by deadline
+            const planned = orders.filter(o => !o.novinka && !isComplete(o) && o.id !== order.id).sort((a,b) => pf(a.seq) - pf(b.seq));
+            let insertIdx = planned.length;
+            for (let i = 0; i < planned.length; i++) {
+              if (planned[i].deadline && order.deadline <= planned[i].deadline) { insertIdx = i; break; }
+              if (!planned[i].deadline) { insertIdx = i; break; }
+            }
+            // Check if neighbors are locked → inherit lock
+            const shouldLock = insertIdx > 0 && planned[insertIdx - 1]?.lock;
+            const newSeq = insertIdx;
+            // Shift all orders at/after insertIdx
+            const patch = { novinka: false, seq: newSeq, seqAP1: newSeq, seqCEN: newSeq, seqHANG: newSeq, lock: shouldLock };
+            const updatedOrders = orders.map(o => {
+              if (o.id === order.id) return { ...o, ...patch };
+              if (!o.novinka && !isComplete(o) && pf(o.seq) >= newSeq) {
+                return { ...o, seq: pf(o.seq) + 1, seqAP1: pf(o.seqAP1) + 1, seqCEN: pf(o.seqCEN) + 1, seqHANG: pf(o.seqHANG) + 1 };
+              }
+              return o;
+            });
+            setOrders(updatedOrders);
+          } else {
+            u("novinka", v);
+          }
+        }}/>
         <Check label="Štítek" checked={order.stitek} onChange={v => u("stitek",v)}/>
         <Check label="VP Polep" checked={order.vpPolep} onChange={v => u("vpPolep",v)}/>
         <Check label="Etiketa" checked={order.etiketa} onChange={v => u("etiketa",v)}/>
@@ -1258,14 +1606,16 @@ function Gantt({ orders, setOrders, packed, dts, setDts, settings, selId, setSel
         const target = mO[ni];
         if (target && target[lk]) return prev; // can't swap with locked
         const [moved] = mO.splice(idx,1); mO.splice(ni,0,moved);
-        // Update this machine's sequence, respecting locks
-        mO.forEach((o,i) => { if (!o[lk]) o[sk]=i; });
-        // Propagate to other sequences for flow consistency (unlocked only)
+        // Update this machine's sequence for moved + FOLLOWING orders only (not previous)
+        const movedIdx = mO.findIndex(o => o.id === dragRef.current.orderId);
+        const startFrom = Math.min(idx, ni, movedIdx);
         mO.forEach((o,i) => {
-          if (!o.lock) o.seq = i;
-          if (!o.lockAP1) o.seqAP1 = i;
-          if (!o.lockCEN) o.seqCEN = i;
-          if (!o.lockHANG) o.seqHANG = i;
+          if (i >= startFrom && !o[lk]) o[sk] = i;
+          // Propagate to downstream sequences ONLY for moved order and orders after it
+          if (i >= startFrom) {
+            if (!o.lock) o.seq = i;
+            o.seqAP1 = i; o.seqCEN = i; o.seqHANG = i;
+          }
         });
         dragRef.current.startY = ev.clientY; return next; }); } };
     const onUp = () => { dragRef.current = null; window.removeEventListener("pointermove",onMove); window.removeEventListener("pointerup",onUp); };
@@ -1324,7 +1674,7 @@ function Gantt({ orders, setOrders, packed, dts, setDts, settings, selId, setSel
               <div onPointerDown={e => handleDrag(e,p.order,m)} onClick={() => setSelId(p.order.id===selId?null:p.order.id)}
                 style={{ position: "absolute", top: y1, left: 52+mi*colW+3, width: colW-6, height: Math.max(h,18),
                   background: p.actEnd?"#16a34a"+"cc":p.wip?"#f59e0b"+"dd":isDraft?MACHINES[m].color+"30":MACHINES[m].color+"dd", borderRadius: 3,
-                  cursor: ro?"default":p.order[{AP1:"lockAP1",CENTRA:"lockCEN",HANG:"lockHANG"}[m]||"lock"]?"not-allowed":"grab", zIndex: 5,
+                  cursor: p.order[{AP1:"lockAP1",CENTRA:"lockCEN",HANG:"lockHANG"}[m]||"lock"]?"not-allowed":"grab", zIndex: 5,
                   border: isSel?`2px solid ${T.tx}`:p.order.lock?`2px solid #dc2626`:`1px solid ${MACHINES[m].color}`,
                   display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", overflow: "hidden", padding: "1px 3px",
                   boxShadow: isSel?"0 0 0 2px #fff":"0 1px 2px rgba(0,0,0,.12)",
